@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: shkifut-worker
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: BATCH_SIZE
+        value: "5"
+      - key: CRON_INTERVAL
+        value: "*/3 * * * *"
+      - key: MAX_RETRIES
+        value: "3"
+      - key: LOG_LEVEL
+        value: "info"
