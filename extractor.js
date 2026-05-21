@@ -6,11 +6,9 @@ import Tesseract   from 'tesseract.js';
 import { fromBuffer } from 'pdf2pic';
 import logger      from './logger.js';
 
-const OCR_LANG = process.env.OCR_LANGUAGE || 'heb+eng';
+const OCR_LANG      = process.env.OCR_LANGUAGE   || 'heb+eng';
+const OCR_TIMEOUT   = parseInt(process.env.OCR_TIMEOUT_MS) || 3 * 60 * 1000; // 3 דקות לעמוד
 
-/* ============================================
-   הורדת קובץ מ-URL
-============================================ */
 export async function downloadFile(url) {
   logger.debug(`Downloading: ${url}`);
   const res = await axios.get(url, {
@@ -21,169 +19,158 @@ export async function downloadFile(url) {
   return Buffer.from(res.data);
 }
 
-/* ============================================
-   חילוץ טקסט ראשי — לפי סוג קובץ
-============================================ */
 export async function extractText(buffer, fileType, docId) {
   const type = (fileType || '').toLowerCase();
-
-  if (type.includes('pdf')) {
-    return extractFromPDF(buffer, docId);
+  try {
+    if (type.includes('pdf'))                                              return await extractFromPDF(buffer, docId);
+    if (type.includes('word') || type.includes('docx') || type.includes('doc')) return await extractFromWord(buffer, docId);
+    if (type.includes('excel') || type.includes('xlsx') || type.includes('xls') || type.includes('spreadsheet')) return await extractFromExcel(buffer, docId);
+    logger.warn(`Unknown file type: ${fileType}`, { docId });
+    return { pages: [], fullText: '', method: 'unknown', pageCount: 0 };
+  } catch (err) {
+    // תפוס כל שגיאה ברמה הגבוהה ביותר
+    logger.error(`extractText failed: ${err.message}`, { docId });
+    throw err; // העבר למעלה — processor יטפל
   }
-  if (type.includes('word') || type.includes('docx') || type.includes('doc')) {
-    return extractFromWord(buffer, docId);
-  }
-  if (type.includes('excel') || type.includes('xlsx') || type.includes('xls') || type.includes('spreadsheet')) {
-    return extractFromExcel(buffer, docId);
-  }
-
-  logger.warn(`Unknown file type: ${fileType}`, { docId });
-  return { pages: [], fullText: '', method: 'unknown' };
 }
 
-/* ============================================
-   PDF — חילוץ טקסט + OCR fallback
-============================================ */
 async function extractFromPDF(buffer, docId) {
-  // נסה חילוץ טקסט רגיל קודם
+  // נסה חילוץ ישיר
   try {
-    const data = await pdfParse(buffer, { max: 0 });
+    const data = await Promise.race([
+      pdfParse(buffer, { max: 0 }),
+      _timeout(30_000, 'pdf-parse timeout'),
+    ]);
     const text = data.text?.trim();
-
     if (text && text.length > 100) {
-      logger.info(`PDF text extracted directly (${text.length} chars)`, { docId });
-      const pages = splitIntoPages(text, data.numpages);
-      return { pages, fullText: text, method: 'direct', pageCount: data.numpages };
+      logger.info(`PDF direct: ${text.length} chars`, { docId });
+      return {
+        pages:     splitIntoPages(text, data.numpages),
+        fullText:  text,
+        method:    'direct',
+        pageCount: data.numpages,
+      };
     }
   } catch (err) {
-    logger.warn(`PDF direct extract failed: ${err.message}`, { docId });
+    // אל תקרוס — נסה OCR
+    logger.warn(`PDF direct failed: ${err.message} — trying OCR`, { docId });
   }
 
-  // Fallback — OCR
-  logger.info('PDF appears scanned, running OCR...', { docId });
+  // OCR
   return ocrPDF(buffer, docId);
 }
 
-/* ============================================
-   OCR — המרת PDF לתמונות + Tesseract
-============================================ */
 async function ocrPDF(buffer, docId) {
   const pages    = [];
   let   fullText = '';
+  let   pageCount = 1;
 
   try {
-    // המרה לתמונות — עמוד אחד בכל פעם
-    const converter = fromBuffer(buffer, {
-      density:  200,
-      format:   'png',
-      width:    1700,
-      height:   2200,
-    });
-
-    // גלה כמה עמודים יש
-    let pageCount = 1;
     try {
-      const info = await pdfParse(buffer, { max: 1 });
-      pageCount  = info.numpages || 1;
-    } catch {}
+      const info = await Promise.race([
+        pdfParse(buffer, { max: 1 }),
+        _timeout(15_000, 'page count timeout'),
+      ]);
+      pageCount = info.numpages || 1;
+    } catch { pageCount = 1; }
 
-    logger.info(`OCR: processing ${pageCount} pages`, { docId });
+    logger.info(`OCR: ${pageCount} pages`, { docId });
+
+    const converter = fromBuffer(buffer, {
+      density: 150, // נמוך יותר — מהיר יותר, פחות זיכרון
+      format:  'png',
+      width:   1400,
+      height:  1980,
+    });
 
     for (let p = 1; p <= pageCount; p++) {
       try {
         logger.debug(`OCR page ${p}/${pageCount}`, { docId });
 
-        const image = await converter(p, { responseType: 'buffer' });
+        const image = await Promise.race([
+          converter(p, { responseType: 'buffer' }),
+          _timeout(OCR_TIMEOUT, `OCR page ${p} timeout`),
+        ]);
+
         if (!image?.buffer) continue;
 
-        const { data: { text } } = await Tesseract.recognize(
-          image.buffer,
-          OCR_LANG,
-          { logger: () => {} }  // suppress verbose output
-        );
+        const { data: { text } } = await Promise.race([
+          Tesseract.recognize(image.buffer, OCR_LANG, { logger: () => {} }),
+          _timeout(OCR_TIMEOUT, `Tesseract page ${p} timeout`),
+        ]);
 
         const cleaned = text?.trim() || '';
         if (cleaned) {
           pages.push({ page: p, text: cleaned });
           fullText += cleaned + '\n';
         }
+
       } catch (pageErr) {
-        logger.warn(`OCR page ${p} failed: ${pageErr.message}`, { docId });
+        // עמוד בודד נכשל — דלג וממשיך
+        logger.warn(`OCR page ${p} failed: ${pageErr.message} — skipping`, { docId });
       }
     }
 
-    logger.info(`OCR complete: ${pages.length} pages, ${fullText.length} chars`, { docId });
+    if (!fullText.trim()) {
+      throw new Error('OCR produced no text — file may be corrupted or unreadable');
+    }
+
+    logger.info(`OCR done: ${pages.length} pages, ${fullText.length} chars`, { docId });
     return { pages, fullText, method: 'ocr', pageCount };
 
   } catch (err) {
     logger.error(`OCR failed: ${err.message}`, { docId });
-    return { pages: [], fullText: '', method: 'ocr_failed', pageCount: 0 };
+    throw err;
   }
 }
 
-/* ============================================
-   Word (DOCX)
-============================================ */
 async function extractFromWord(buffer, docId) {
   try {
-    const result = await mammoth.extractRawText({ buffer });
-    const text   = result.value?.trim() || '';
-    logger.info(`Word extracted: ${text.length} chars`, { docId });
-    return {
-      pages:     [{ page: 1, text }],
-      fullText:  text,
-      method:    'word',
-      pageCount: 1,
-    };
+    const result = await Promise.race([
+      mammoth.extractRawText({ buffer }),
+      _timeout(60_000, 'Word extraction timeout'),
+    ]);
+    const text = result.value?.trim() || '';
+    if (!text) throw new Error('Word file produced no text');
+    logger.info(`Word: ${text.length} chars`, { docId });
+    return { pages: [{ page: 1, text }], fullText: text, method: 'word', pageCount: 1 };
   } catch (err) {
-    logger.error(`Word extraction failed: ${err.message}`, { docId });
-    return { pages: [], fullText: '', method: 'word_failed', pageCount: 0 };
+    logger.error(`Word failed: ${err.message}`, { docId });
+    throw err;
   }
 }
 
-/* ============================================
-   Excel (XLSX/XLS)
-============================================ */
 async function extractFromExcel(buffer, docId) {
   try {
-    const wb   = XLSX.read(buffer, { type: 'buffer' });
-    let   text = '';
+    const wb    = XLSX.read(buffer, { type: 'buffer' });
+    let   text  = '';
     const pages = [];
-
     wb.SheetNames.forEach((name, i) => {
-      const sheet   = wb.Sheets[name];
-      const csv     = XLSX.utils.sheet_to_csv(sheet);
-      const cleaned = csv.trim();
-      if (cleaned) {
-        text += `\n--- גיליון: ${name} ---\n${cleaned}\n`;
-        pages.push({ page: i + 1, text: `גיליון: ${name}\n${cleaned}` });
+      const csv = XLSX.utils.sheet_to_csv(wb.Sheets[name]).trim();
+      if (csv) {
+        text += `\n--- ${name} ---\n${csv}\n`;
+        pages.push({ page: i + 1, text: `${name}\n${csv}` });
       }
     });
-
-    logger.info(`Excel extracted: ${wb.SheetNames.length} sheets, ${text.length} chars`, { docId });
+    if (!text.trim()) throw new Error('Excel file produced no text');
+    logger.info(`Excel: ${wb.SheetNames.length} sheets`, { docId });
     return { pages, fullText: text.trim(), method: 'excel', pageCount: wb.SheetNames.length };
-
   } catch (err) {
-    logger.error(`Excel extraction failed: ${err.message}`, { docId });
-    return { pages: [], fullText: '', method: 'excel_failed', pageCount: 0 };
+    logger.error(`Excel failed: ${err.message}`, { docId });
+    throw err;
   }
 }
 
-/* ============================================
-   עזר — חלוקת טקסט לעמודים לפי מספר עמודים
-============================================ */
 function splitIntoPages(text, numPages) {
   if (numPages <= 1) return [{ page: 1, text }];
-
-  const charsPerPage = Math.ceil(text.length / numPages);
-  const pages        = [];
-
+  const cpp   = Math.ceil(text.length / numPages);
+  const pages = [];
   for (let p = 0; p < numPages; p++) {
-    const start   = p * charsPerPage;
-    const end     = Math.min(start + charsPerPage, text.length);
-    const content = text.slice(start, end).trim();
+    const content = text.slice(p * cpp, (p + 1) * cpp).trim();
     if (content) pages.push({ page: p + 1, text: content });
   }
-
   return pages;
 }
+
+const _timeout = (ms, msg) =>
+  new Promise((_, reject) => setTimeout(() => reject(new Error(msg)), ms));
