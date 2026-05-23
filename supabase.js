@@ -97,3 +97,14 @@ export async function logError(docId, queueId, error) {
 }
 
 export default { getPendingDocs, updateQueueStatus, incrementAttempt, updateDocument, saveChunks, deleteOldChunks, logError };
+
+export async function getQueueStats() {
+  const { data, error } = await supabase
+    .from('nv_processing_queue')
+    .select('status')
+    .in('status', ['pending','processing','done','error']);
+  if (error) return { pending:0, processing:0, done:0, error:0 };
+  const counts = { pending:0, processing:0, done:0, error:0 };
+  (data||[]).forEach(r => { if (counts[r.status] !== undefined) counts[r.status]++; });
+  return counts;
+}
