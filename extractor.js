@@ -4,9 +4,6 @@ import mammoth  from 'mammoth';
 import * as XLSX from 'xlsx';
 import logger   from './logger.js';
 
-const OCR_LANG    = process.env.OCR_LANGUAGE || 'heb+eng';
-const USE_OCR     = process.env.USE_OCR !== 'false'; // true by default
-
 export async function downloadFile(url) {
   const res = await axios.get(url, {
     responseType: 'arraybuffer',
@@ -21,23 +18,21 @@ export async function extractText(buffer, fileType, docId) {
   if (type.includes('pdf'))    return extractFromPDF(buffer, docId);
   if (type.includes('word') || type.includes('docx') || type.includes('doc')) return extractFromWord(buffer, docId);
   if (type.includes('excel') || type.includes('xlsx') || type.includes('xls')) return extractFromExcel(buffer, docId);
-  logger.warn(`Unknown file type: ${fileType}`, { docId });
   return { pages: [], fullText: '', method: 'unknown', pageCount: 0 };
 }
 
 /* ============================================
-   PDF — שלושה שלבים:
+   PDF — שני שלבים בלבד (ללא pdf2pic)
    1. pdfParse ישיר
-   2. pdfParse עמוד-עמוד
-   3. OCR דרך Tesseract (אם זמין)
+   2. pdfParse עמוד-עמוד עם render callback
 ============================================ */
 async function extractFromPDF(buffer, docId) {
 
-  /* שלב 1 — חילוץ טקסט ישיר */
+  /* שלב 1 — חילוץ ישיר מלא */
   try {
     const data = await withTimeout(pdfParse(buffer, { max: 0 }), 60_000);
     const text = data.text?.trim() || '';
-    if (text.length > 100) {
+    if (text.length > 50) {
       logger.info(`PDF direct: ${text.length} chars, ${data.numpages} pages`, { docId });
       return {
         pages:     splitIntoPages(text, data.numpages),
@@ -46,115 +41,54 @@ async function extractFromPDF(buffer, docId) {
         pageCount: data.numpages || 1,
       };
     }
-    logger.info(`PDF direct: text too short (${text.length} chars) — trying OCR`, { docId });
+    logger.info(`PDF direct: only ${text.length} chars — trying page-by-page`, { docId });
   } catch (err) {
     logger.warn(`PDF direct failed: ${err.message}`, { docId });
   }
 
-  /* שלב 2 — OCR דרך Tesseract */
-  if (USE_OCR) {
-    const ocrResult = await tryOCRWithTesseract(buffer, docId);
-    if (ocrResult && ocrResult.fullText.length > 50) {
-      return ocrResult;
-    }
-  }
-
-  /* שלב 3 — כישלון מוחלט */
-  throw new Error('PDF has no extractable text and OCR failed or disabled');
-}
-
-/* ============================================
-   OCR דרך Tesseract.js — בטוח לחלוטין
-   משתמש ב-canvas/jimp לרינדור עמודים
-============================================ */
-async function tryOCRWithTesseract(buffer, docId) {
+  /* שלב 2 — עמוד אחר עמוד */
   try {
-    // נסה לייבא Tesseract
-    let Tesseract;
-    try {
-      const mod = await import('tesseract.js');
-      Tesseract = mod.default || mod;
-    } catch (e) {
-      logger.warn(`Tesseract not available: ${e.message}`, { docId });
-      return null;
-    }
-
-    // קבל מספר עמודים
     let pageCount = 1;
     try {
       const info = await withTimeout(pdfParse(buffer, { max: 1 }), 15_000);
-      pageCount = Math.min(info.numpages || 1, 30); // מקסימום 30 עמודים
+      pageCount  = info.numpages || 1;
     } catch { pageCount = 1; }
 
-    logger.info(`OCR via Tesseract: ${pageCount} pages`, { docId });
+    logger.info(`PDF page-by-page: ${pageCount} pages`, { docId });
 
-    // נסה להשיג תמונות דרך pdf2pic אם זמין
-    let images = [];
-    try {
-      const { fromBuffer } = await import('pdf2pic');
-      const converter = fromBuffer(buffer, {
-        density: 100,
-        format:  'png',
-        width:   1200,
-        height:  1600,
-      });
-
-      for (let p = 1; p <= pageCount; p++) {
-        try {
-          const img = await withTimeout(
-            new Promise((resolve) => {
-              setImmediate(async () => {
-                try {
-                  const r = await converter(p, { responseType: 'buffer' });
-                  resolve(r?.buffer || null);
-                } catch { resolve(null); }
-              });
-            }),
-            60_000
-          );
-          if (img) images.push({ page: p, buffer: img });
-        } catch { /* דלג על עמוד */ }
-      }
-    } catch (e) {
-      logger.warn(`pdf2pic not available: ${e.message} — OCR skipped`, { docId });
-      return null;
-    }
-
-    if (!images.length) {
-      logger.warn(`No images from PDF for OCR`, { docId });
-      return null;
-    }
-
-    // OCR על כל עמוד
     const pages    = [];
     let   fullText = '';
 
-    for (const { page, buffer: imgBuf } of images) {
+    for (let p = 1; p <= Math.min(pageCount, 100); p++) {
       try {
-        const { data: { text } } = await withTimeout(
-          Tesseract.recognize(imgBuf, OCR_LANG, { logger: () => {} }),
-          120_000
+        const pageData = await withTimeout(
+          pdfParse(buffer, {
+            max:       1,
+            firstPage: p,
+          }),
+          20_000
         );
-        const cleaned = text?.trim() || '';
-        if (cleaned.length > 10) {
-          pages.push({ page, text: cleaned });
-          fullText += cleaned + '\n';
-          logger.debug(`OCR page ${page}: ${cleaned.length} chars`, { docId });
+        const text = pageData.text?.trim() || '';
+        if (text.length > 5) {
+          pages.push({ page: p, text });
+          fullText += text + '\n';
         }
       } catch (pageErr) {
-        logger.warn(`OCR page ${page} failed: ${pageErr.message}`, { docId });
+        logger.debug(`Page ${p} failed: ${pageErr.message}`, { docId });
       }
     }
 
-    if (!fullText.trim()) return null;
-
-    logger.info(`OCR done: ${pages.length}/${pageCount} pages, ${fullText.length} chars`, { docId });
-    return { pages, fullText, method: 'ocr', pageCount };
-
+    if (fullText.trim().length > 50) {
+      logger.info(`PDF page-by-page: ${pages.length}/${pageCount} pages, ${fullText.length} chars`, { docId });
+      return { pages, fullText, method: 'direct_pages', pageCount };
+    }
   } catch (err) {
-    logger.error(`OCR error: ${err.message}`, { docId });
-    return null;
+    logger.warn(`PDF page-by-page failed: ${err.message}`, { docId });
   }
+
+  /* שלב 3 — PDF סרוק ללא טקסט */
+  logger.warn(`PDF has no extractable text — marking as ocr_required`, { docId });
+  throw new Error('PDF has no extractable text (scanned). Mark as ocr_required.');
 }
 
 /* ---- Word ---- */
