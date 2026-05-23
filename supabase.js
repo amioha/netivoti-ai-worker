@@ -81,18 +81,15 @@ export async function deleteOldChunks(docId) {
   return req('DELETE', 'nv_chunks', { document_id: `eq.${docId}` });
 }
 
-/* ---- שמירת לוג שגיאה מפורטת ---- */
+/* ---- שמירת לוג שגיאה — מתעלם אם הטבלה לא קיימת ---- */
 export async function logError(docId, queueId, error) {
+  // נשמור רק ב-last_error של המסמך — לא צריך טבלה נפרדת
   try {
-    await req('POST', 'nv_error_log', {}, {
-      document_id: docId,
-      queue_id:    queueId,
-      error_msg:   error.message,
-      stack_trace: error.stack,
-      created_at:  new Date().toISOString(),
+    await updateDocument(docId, {
+      last_error: error.message?.slice(0, 500) || 'Unknown error',
     });
   } catch {
-    // אל תיכשל בגלל לוג כושל
+    // ignore
   }
 }
 
